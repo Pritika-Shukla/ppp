@@ -1,32 +1,11 @@
 import "dotenv/config";
 import express, { Request, Response } from "express";
 import cors from "cors";
-import fs from "fs";
-import path from "path";
 import { nanoid } from "nanoid";
 import { PrismaClient } from "@prisma/client";
 
-/* ----------------------------- */
-/* File Logger (for ngrok/deployed) */
-/* ----------------------------- */
-
-const LOG_FILE = path.join(process.cwd(), "server.log");
-
-function log(...args: unknown[]) {
-  const msg = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
-  const line = `[${new Date().toISOString()}] ${msg}\n`;
-  fs.appendFileSync(LOG_FILE, line);
-  console.log(...args);
-}
-
-function logError(...args: unknown[]) {
-  const msg = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
-  const line = `[${new Date().toISOString()}] [ERROR] ${msg}\n`;
-  fs.appendFileSync(LOG_FILE, line);
-  console.error(...args);
-}
-
 const app = express();
+const prisma = new PrismaClient();
 const PORT = process.env.PORT || 3000;
 
 /* ----------------------------- */
@@ -34,20 +13,13 @@ const PORT = process.env.PORT || 3000;
 /* ----------------------------- */
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Debug logger
 app.use((req, _res, next) => {
-  log(`${req.method} ${req.url}`);
+  console.log(`${req.method} ${req.url}`);
   next();
 });
-
-/* ----------------------------- */
-/* Database */
-/* ----------------------------- */
-
-const prisma = new PrismaClient();
 
 /* ----------------------------- */
 /* Health */
@@ -66,21 +38,18 @@ app.get("/api/health", (_req: Request, res: Response) => {
 /* ----------------------------- */
 
 app.post("/api/apps", async (req: Request, res: Response) => {
-  log("BODY:", req.body);
-
   const { name, supabaseUrl, userId } = req.body;
 
   if (!supabaseUrl || typeof supabaseUrl !== "string") {
     return res.status(400).json({
-      error:
-        "Missing supabaseUrl. Make sure Content-Type: application/json is set.",
+      error: "Missing supabaseUrl",
     });
   }
 
   if (!supabaseUrl.includes("supabase.co")) {
-    return res
-      .status(400)
-      .json({ error: "Invalid Supabase project URL." });
+    return res.status(400).json({
+      error: "Invalid Supabase project URL",
+    });
   }
 
   const slug = nanoid(8);
@@ -97,22 +66,22 @@ app.post("/api/apps", async (req: Request, res: Response) => {
   res.json({
     message: "App created successfully",
     slug,
-    proxyBase: `http://localhost:${PORT}/p/${slug}`,
+    proxyBase: `${req.protocol}://${req.get("host")}/p/${slug}`,
   });
 });
 
 /* ----------------------------- */
-/* Main Proxy Route */
+/* Correct Proxy Route */
 /* ----------------------------- */
 
-app.all("/p/:slug/*path", async (req: Request, res: Response) => {
+app.all("/p/:slug/*", async (req: Request, res: Response) => {
   try {
-    const slug = Array.isArray(req.params.slug)
-      ? req.params.slug[0]
-      : (req.params.slug ?? "");
-    const path = Array.isArray(req.params.path)
-      ? req.params.path.join("/")
-      : (req.params.path ?? "");
+    const slug = req.params.slug;
+    const path = req.params[0]; // IMPORTANT: wildcard is stored here
+
+    if (!path) {
+      return res.status(400).json({ error: "Missing path" });
+    }
 
     const project = await prisma.app.findUnique({
       where: { slug },
@@ -122,56 +91,41 @@ app.all("/p/:slug/*path", async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Invalid slug" });
     }
 
-    // Allow only specific Supabase paths
+    // Only allow safe Supabase endpoints
     const allowedPrefixes = ["rest/v1", "auth/v1", "storage/v1"];
 
     if (!allowedPrefixes.some((prefix) => path.startsWith(prefix))) {
       return res.status(403).json({ error: "Route not allowed" });
     }
 
-    const queryString = req.url.includes("?")
-      ? "?" + req.url.split("?")[1]
-      : "";
+    const targetURL =
+      `${project.supabaseUrl}/${path}` +
+      (req.url.includes("?") ? "?" + req.url.split("?")[1] : "");
 
-    const targetURL = `${project.supabaseUrl}/${path}${queryString}`;
+    console.log("Forwarding to:", targetURL);
 
-    log("Forwarding to:", targetURL);
-
-    // Clone headers safely
+    // Forward ONLY required headers
     const headers: Record<string, string> = {};
 
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === "string") {
-        headers[key] = value;
-      }
+    if (req.headers.apikey) {
+      headers.apikey = req.headers.apikey as string;
     }
 
-    // Remove unsafe headers
-    delete headers.host;
-    delete headers["x-forwarded-for"];
-    delete headers["cf-connecting-ip"];
-    delete headers["x-real-ip"];
+    if (req.headers.authorization) {
+      headers.authorization = req.headers.authorization as string;
+    }
 
     const response = await fetch(targetURL, {
       method: req.method,
       headers,
-      body:
-        req.method === "GET" || req.method === "HEAD"
-          ? undefined
-          : JSON.stringify(req.body),
     });
 
-    const buffer = await response.arrayBuffer();
+    const data = await response.text();
 
-    res.status(response.status);
+    res.status(response.status).send(data);
 
-    response.headers.forEach((value, key) => {
-      res.setHeader(key, value);
-    });
-
-    res.send(Buffer.from(buffer));
   } catch (error) {
-    logError("Proxy error:", error);
+    console.error("Proxy error:", error);
     res.status(500).json({ error: "Proxy failed" });
   }
 });
@@ -181,5 +135,5 @@ app.all("/p/:slug/*path", async (req: Request, res: Response) => {
 /* ----------------------------- */
 
 app.listen(PORT, () => {
-  log(`Server running on http://localhost:${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
